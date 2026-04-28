@@ -1,0 +1,24 @@
+# cloudflared official configuration
+#
+# Use this file as the single source of truth for hostname -> local service routing.
+# This can be used both by cloudflared and by the server's Public Gateway config loader.
+#
+# Required:
+# - Set the tunnel UUID below
+# - Set credentials-file to the JSON created by `cloudflared tunnel login` or your service install
+#
+# Notes:
+# - Do NOT commit tunnel token secrets into git.
+# - The server reads this file by default from: server/config/cloudflared.yml
+
+tunnel: 6ec068de-d21e-4e82-a446-e02ed28f8569
+credentials-file: /home/sahon/.cloudflared/zombiecoder-tunnel.json
+
+ingress:
+  - hostname: a.zombiecoder.my.id
+    service: http://127.0.0.1:8000
+  - hostname: zombiecoder.my.id
+    service: http://127.0.0.1:3000
+  - hostname: c.zombiecoder.my.id
+    service: http://127.0.0.1:15000
+  - service: http_status:404

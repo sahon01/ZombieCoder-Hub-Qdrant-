@@ -1,0 +1,171 @@
+{
+  "name": "zombie-dance-ai",
+  "displayName": "Zombie Dance AI",
+  "description": "Real-time AI agent integration with ZombieCoder server",
+  "version": "1.0.0",
+  "publisher": "zombie-coder",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Other",
+    "Machine Learning",
+    "Snippets"
+  ],
+  "keywords": [
+    "ai",
+    "zombie",
+    "dance",
+    "agent",
+    "websocket",
+    "real-time"
+  ],
+  "homepage": "https://github.com/zombie-coder/zombie-dance-ai",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zombie-coder/zombie-dance-ai.git"
+  },
+  "bugs": {
+    "url": "https://github.com/zombie-coder/zombie-dance-ai/issues"
+  },
+  "license": "MIT",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "zombie-dance.openPanel",
+        "title": "Open Zombie Dance AI Panel",
+        "icon": "$(robot)",
+        "category": "Zombie Dance"
+      },
+      {
+        "command": "zombie-dance.connectServer",
+        "title": "Connect to Zombie Server",
+        "icon": "$(plug)",
+        "category": "Zombie Dance"
+      },
+      {
+        "command": "zombie-dance.disconnectServer",
+        "title": "Disconnect from Server",
+        "icon": "$(debug-disconnect)",
+        "category": "Zombie Dance"
+      },
+      {
+        "command": "zombie-dance.mcpListTools",
+        "title": "MCP: List Tools",
+        "icon": "$(list-unordered)",
+        "category": "Zombie Dance"
+      },
+      {
+        "command": "zombie-dance.mcpExecuteTool",
+        "title": "MCP: Execute Tool",
+        "icon": "$(play)",
+        "category": "Zombie Dance"
+      }
+    ],
+    "views": {
+      "explorer": [
+        {
+          "id": "zombie-dance-explorer",
+          "name": "Zombie Dance AI",
+          "when": "zombie-dance.connected",
+          "icon": "$(robot)"
+        }
+      ]
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "zombie-dance",
+          "title": "Zombie Dance",
+          "icon": "$(robot)"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Zombie Dance AI",
+      "properties": {
+        "zombie-dance.serverUrl": {
+          "type": "string",
+          "default": "http://localhost:8000",
+          "description": "Zombie Dance server URL",
+          "pattern": "^https?://.+"
+        },
+        "zombie-dance.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "API key used for protected endpoints (sent as X-API-Key). Leave empty if not needed."
+        },
+        "zombie-dance.autoConnect": {
+          "type": "boolean",
+          "default": true,
+          "description": "Auto-connect to server on startup"
+        },
+        "zombie-dance.theme": {
+          "type": "string",
+          "enum": [
+            "dark",
+            "light",
+            "auto"
+          ],
+          "default": "dark",
+          "description": "UI theme preference"
+        }
+      }
+    },
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "zombie-dance.openPanel",
+          "when": "zombie-dance.connected"
+        },
+        {
+          "command": "zombie-dance.connectServer",
+          "when": "!zombie-dance.connected"
+        },
+        {
+          "command": "zombie-dance.disconnectServer",
+          "when": "zombie-dance.connected"
+        },
+        {
+          "command": "zombie-dance.mcpListTools"
+        },
+        {
+          "command": "zombie-dance.mcpExecuteTool"
+        }
+      ],
+      "activitybar": [
+        {
+          "command": "zombie-dance.openPanel",
+          "when": "zombie-dance.connected",
+          "group": "navigation"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src --ext ts",
+    "test": "node ./out/test/runTest.js",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.75.0",
+    "@types/node": "16.x",
+    "@types/ws": "^8.5.10",
+    "@typescript-eslint/eslint-plugin": "^5.45.0",
+    "@typescript-eslint/parser": "^5.45.0",
+    "eslint": "^8.28.0",
+    "typescript": "^4.9.4",
+    "vsce": "^2.15.0"
+  },
+  "dependencies": {
+    "ws": "^8.14.2"
+  }
+}
