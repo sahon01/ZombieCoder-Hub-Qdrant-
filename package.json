@@ -16,7 +16,7 @@
     "@hookform/resolvers": "^3.10.0",
     "@llama-node/llama-cpp": "^0.1.6",
     "@llama-node/rwkv-cpp": "^0.1.6",
-    "@modelcontextprotocol/sdk": "^1.27.1",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@qdrant/qdrant-js": "^1.17.0",
     "@radix-ui/react-accordion": "1.2.2",
     "@radix-ui/react-alert-dialog": "1.1.4",
@@ -83,7 +83,7 @@
     "vaul": "^1.1.2",
     "winston": "3.19.0",
     "ws": "8.19.0",
-    "zod": "3.25.67"
+    "zod": "^3.25.67"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.1.9",

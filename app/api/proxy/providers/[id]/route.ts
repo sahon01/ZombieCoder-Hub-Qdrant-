@@ -26,12 +26,26 @@ export async function GET(request: NextRequest, context: { params: Promise<{ id:
 
     if (data && data.success && data.data) {
       const p = data.data
+      const config = (() => {
+        const raw = p?.config || p?.config_json || {}
+        if (!raw) return {}
+        if (typeof raw === "object") return raw
+        if (typeof raw === "string") {
+          try {
+            return raw.trim() ? JSON.parse(raw) : {}
+          } catch {
+            return {}
+          }
+        }
+        return {}
+      })()
       const provider = {
         id: p.id,
         name: p.name,
         type: p.type,
         endpoint: p.endpoint,
         status: p.isActive ? "active" : "inactive",
+        config,
         fallbackConfig: {
           enabled: false,
           fallbackTo: null,

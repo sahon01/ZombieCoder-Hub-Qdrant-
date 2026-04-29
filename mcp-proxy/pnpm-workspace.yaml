@@ -1,0 +1,7 @@
+ignoredBuiltDependencies:
+  - '@modelcontextprotocol/ext-apps'
+  - '@parcel/watcher'
+  - '@scarf/scarf'
+  - core-js
+  - esbuild
+  - protobufjs

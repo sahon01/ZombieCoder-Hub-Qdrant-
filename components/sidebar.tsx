@@ -20,6 +20,7 @@ import {
   Lightbulb,
   CheckSquare,
   Music,
+  Wrench,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 
@@ -31,8 +32,11 @@ const navigation = [
   { name: "Agents", href: "/agents", icon: Bot },
   { name: "Servers", href: "/servers", icon: Server },
   { name: "Memory", href: "/memory", icon: Database },
+  { name: "Vector DB", href: "/vector-db", icon: Database },
+  { name: "System Docs", href: "/system-docs", icon: BookOpen },
   { name: "Load Balancer", href: "/loadbalancer", icon: Scale },
   { name: "Prompt Templates", href: "/prompt-templates", icon: FileCode },
+  { name: "Tools", href: "/tools", icon: Wrench },
   { name: "CLI Agent", href: "/cli-agent", icon: Terminal },
   { name: "Editor Integration", href: "/editor-integration", icon: Code2 },
   { name: "Audio Test", href: "/audio-test", icon: Mic },

@@ -64,12 +64,19 @@ export default function ProviderEditPage() {
       setProvider(p)
 
       if (p) {
+        const cfg = (data.provider as any)?.config
         setForm({
           name: p.name,
           type: p.type || "llama_cpp",
           endpoint: p.endpoint,
           isActive: p.status === "active",
-          configJson: "{}",
+          configJson: (() => {
+            try {
+              return JSON.stringify(typeof cfg === "object" && cfg ? cfg : {}, null, 2)
+            } catch {
+              return "{}"
+            }
+          })(),
         })
       }
     } catch (e) {

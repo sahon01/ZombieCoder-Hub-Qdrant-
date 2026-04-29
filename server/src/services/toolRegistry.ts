@@ -191,7 +191,7 @@ try {
         const allowedCommands = config.allowed_commands || ['git', 'npm', 'node', 'python', 'ls', 'cat'];
 
         return new DynamicTool({
-            name: 'shell_executor',
+            name: 'shell_exec',
             description: `Execute local shell commands. Allowed commands: ${allowedCommands.join(', ')}. Always run in ${this.projectRoot} directory.`,
             func: async (command: string) => {
                 try {

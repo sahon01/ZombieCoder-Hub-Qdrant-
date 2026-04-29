@@ -1,5 +1,6 @@
 import express, { Request, Response } from 'express';
 import axios from 'axios';
+import crypto from 'crypto';
 import { executeQuery } from '../database/connection';
 import { Logger } from '../utils/logger';
 
@@ -17,7 +18,98 @@ function safeJsonParse(value: any): any {
     }
 }
 
-function resolveApiKeyFromProviderConfig(config: any): string | null {
+function getEncryptionKey(): Buffer {
+    const raw = String(process.env.PROVIDER_SECRETS_KEY || process.env.APP_ENCRYPTION_KEY || '').trim();
+    if (!raw) {
+        throw new Error('Missing PROVIDER_SECRETS_KEY (or APP_ENCRYPTION_KEY) env var for encrypting provider secrets');
+    }
+    // Accept base64 or hex or raw; normalize to 32 bytes.
+    const asBase64 = (() => {
+        try {
+            const b = Buffer.from(raw, 'base64');
+            if (b.length === 32) return b;
+        } catch {
+        }
+        return null;
+    })();
+    if (asBase64) return asBase64;
+
+    const asHex = (() => {
+        try {
+            const b = Buffer.from(raw, 'hex');
+            if (b.length === 32) return b;
+        } catch {
+        }
+        return null;
+    })();
+    if (asHex) return asHex;
+
+    return crypto.createHash('sha256').update(raw, 'utf8').digest();
+}
+
+function encryptSecret(plaintext: string): string {
+    const key = getEncryptionKey();
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+    const ciphertext = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+    const tag = cipher.getAuthTag();
+    return `enc:${iv.toString('base64')}:${tag.toString('base64')}:${ciphertext.toString('base64')}`;
+}
+
+function decryptSecret(value: string): string | null {
+    const raw = String(value || '');
+    if (!raw.startsWith('enc:')) return raw || null;
+    const parts = raw.split(':');
+    if (parts.length !== 4) return null;
+    const [, ivB64, tagB64, ctB64] = parts;
+    const key = getEncryptionKey();
+    const iv = Buffer.from(ivB64, 'base64');
+    const tag = Buffer.from(tagB64, 'base64');
+    const ciphertext = Buffer.from(ctB64, 'base64');
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+    decipher.setAuthTag(tag);
+    const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString('utf8');
+    return plaintext || null;
+}
+
+async function upsertSystemSetting(key: string, value: string): Promise<void> {
+    await executeQuery(
+        `INSERT INTO system_settings (setting_key, setting_value)
+         VALUES (?, ?)
+         ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)`,
+        [key, value]
+    );
+}
+
+async function getSystemSetting(key: string): Promise<string | null> {
+    const rows: any[] = await executeQuery(
+        'SELECT setting_value FROM system_settings WHERE setting_key = ? LIMIT 1',
+        [key]
+    );
+    if (!Array.isArray(rows) || rows.length === 0) return null;
+    return (rows[0] as any)?.setting_value ?? null;
+}
+
+function isValidEnvVarName(name: string): boolean {
+    return /^[A-Z_][A-Z0-9_]*$/.test(name);
+}
+
+async function resolveApiKeyFromProviderConfig(config: any, providerId?: string | number | null): Promise<string | null> {
+    // 1) DB/admin secrets store
+    const wantsDb = Boolean(providerId) && ((global as any).connection);
+    if (wantsDb) {
+        try {
+            const k = `provider_api_key_${String(providerId)}`;
+            const v = await getSystemSetting(k);
+            if (v) {
+                const dec = decryptSecret(String(v));
+                if (dec) return dec;
+            }
+        } catch {
+        }
+    }
+
+    // 2) Env var reference from config
     const envVar = typeof config?.apiKeyEnvVar === 'string' ? config.apiKeyEnvVar.trim() : '';
     if (envVar && process.env[envVar]) return String(process.env[envVar]);
     if (process.env.OLLAMA_CLOUD_API_KEY) return String(process.env.OLLAMA_CLOUD_API_KEY);
@@ -27,8 +119,8 @@ function resolveApiKeyFromProviderConfig(config: any): string | null {
     return null;
 }
 
-function buildAuthHeadersFromConfig(config: any): Record<string, string> {
-    const token = resolveApiKeyFromProviderConfig(config);
+async function buildAuthHeadersFromConfig(config: any, providerId?: string | number | null): Promise<Record<string, string>> {
+    const token = await resolveApiKeyFromProviderConfig(config, providerId);
     if (!token) return {};
     return { Authorization: `Bearer ${token}` };
 }
@@ -60,7 +152,7 @@ async function fetchProviderModelsCatalog(provider: any): Promise<any[]> {
     const timeout = 12000;
 
     if (providerType === 'google' || providerType === 'gemini') {
-        const apiKey = resolveApiKeyFromProviderConfig(config);
+        const apiKey = await resolveApiKeyFromProviderConfig(config, provider?.id);
         if (!apiKey) {
             throw new Error('Gemini API key not configured (config_json.apiKeyEnvVar বা GOOGLE_GEMINI_API_KEY দিন)');
         }
@@ -96,7 +188,7 @@ async function fetchProviderModelsCatalog(provider: any): Promise<any[]> {
         const response = await axios.get(url, {
             timeout,
             validateStatus: () => true,
-            headers: { Accept: 'application/json', ...buildAuthHeadersFromConfig(config) }
+            headers: { Accept: 'application/json', ...(await buildAuthHeadersFromConfig(config, provider?.id)) }
         });
         if (response.status < 200 || response.status >= 300) {
             const msg = typeof response.data === 'object' ? JSON.stringify(response.data) : String(response.data);
@@ -295,7 +387,7 @@ router.get('/:id/models', async (req: Request, res: Response) => {
         const timeout = 12000;
 
         if (providerType === 'google' || providerType === 'gemini') {
-            const apiKey = resolveApiKeyFromProviderConfig(config);
+            const apiKey = await resolveApiKeyFromProviderConfig(config, provider?.id);
             if (!apiKey) {
                 return res.status(400).json({
                     success: false,
@@ -354,7 +446,7 @@ router.get('/:id/models', async (req: Request, res: Response) => {
             const response = await axios.get(url, {
                 timeout,
                 validateStatus: () => true,
-                headers: { Accept: 'application/json', ...buildAuthHeadersFromConfig(config) }
+                headers: { Accept: 'application/json', ...(await buildAuthHeadersFromConfig(config, provider?.id)) }
             });
             if (response.status < 200 || response.status >= 300) {
                 const msg = typeof response.data === 'object' ? JSON.stringify(response.data) : String(response.data);
@@ -479,11 +571,19 @@ router.post('/', async (req: Request, res: Response) => {
             });
         }
 
+        const providedApiKey = (config && typeof config === 'object' && typeof (config as any).apiKey === 'string')
+            ? String((config as any).apiKey).trim()
+            : '';
+
         const sanitizedConfig = (() => {
             if (!config || typeof config !== 'object') return {};
             const copy = { ...(config as any) };
-            if (typeof (copy as any).apiKey === 'string') {
-                delete (copy as any).apiKey;
+            if (typeof (copy as any).apiKey === 'string') delete (copy as any).apiKey;
+            if (typeof (copy as any).apiKeyEnvVar === 'string') {
+                const v = String((copy as any).apiKeyEnvVar || '').trim();
+                if (v && !isValidEnvVarName(v)) {
+                    delete (copy as any).apiKeyEnvVar;
+                }
             }
             return copy;
         })();
@@ -494,6 +594,16 @@ router.post('/', async (req: Request, res: Response) => {
                 VALUES (?, ?, ?, ?, ?)
             `;
             const result: any = await executeQuery(query, [name, type, effectiveEndpoint, JSON.stringify(sanitizedConfig), isActive]);
+
+            // Store API key securely (DB first), if provided
+            if (providedApiKey) {
+                try {
+                    const providerId = result.insertId;
+                    await upsertSystemSetting(`provider_api_key_${String(providerId)}`, encryptSecret(providedApiKey));
+                } catch (e: any) {
+                    logger.warn('Provider created but failed to store apiKey in system_settings', e);
+                }
+            }
 
             res.status(201).json({
                 success: true,
@@ -655,7 +765,7 @@ router.post('/:id/test', async (req: Request, res: Response) => {
 
         // Provider-specific health checks
         if (providerType === 'google' || providerType === 'gemini') {
-            const apiKey = resolveApiKeyFromProviderConfig(config);
+            const apiKey = await resolveApiKeyFromProviderConfig(config, provider?.id);
             if (!apiKey) {
                 return res.status(400).json({
                     success: false,
@@ -701,7 +811,7 @@ router.post('/:id/test', async (req: Request, res: Response) => {
                     const response = await axios.get(url, {
                         timeout: 8000,
                         validateStatus: () => true,
-                        headers: { Accept: 'application/json', ...buildAuthHeadersFromConfig(config) }
+                        headers: { Accept: 'application/json', ...(await buildAuthHeadersFromConfig(config, provider?.id)) }
                     });
                     if (response.status >= 200 && response.status < 300) {
                         return respondSuccess(url, response.status);
@@ -751,11 +861,19 @@ router.put('/:id', async (req: Request, res: Response) => {
         const { id } = req.params;
         const { name, type, endpoint, config, isActive } = req.body;
 
+        const providedApiKey = (config && typeof config === 'object' && typeof (config as any).apiKey === 'string')
+            ? String((config as any).apiKey).trim()
+            : '';
+
         const sanitizedConfig = (() => {
             if (!config || typeof config !== 'object') return undefined;
             const copy = { ...(config as any) };
-            if (typeof (copy as any).apiKey === 'string') {
-                delete (copy as any).apiKey;
+            if (typeof (copy as any).apiKey === 'string') delete (copy as any).apiKey;
+            if (typeof (copy as any).apiKeyEnvVar === 'string') {
+                const v = String((copy as any).apiKeyEnvVar || '').trim();
+                if (v && !isValidEnvVarName(v)) {
+                    delete (copy as any).apiKeyEnvVar;
+                }
             }
             return copy;
         })();
@@ -793,6 +911,15 @@ router.put('/:id', async (req: Request, res: Response) => {
                 isActive,
                 id
             ]);
+
+            // Store API key securely (DB first), if provided
+            if (providedApiKey) {
+                try {
+                    await upsertSystemSetting(`provider_api_key_${String(id)}`, encryptSecret(providedApiKey));
+                } catch (e: any) {
+                    logger.warn('Provider updated but failed to store apiKey in system_settings', e);
+                }
+            }
 
             res.json({
                 success: true,

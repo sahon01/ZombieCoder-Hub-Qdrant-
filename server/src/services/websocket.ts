@@ -49,7 +49,9 @@ export class WebSocketService {
             this.logger.warn('Failed to load default_model from system_settings, falling back to env/default:', error);
         }
 
-        return process.env.OLLAMA_DEFAULT_MODEL || 'llama3.1:latest';
+        const envValue = String(process.env.OLLAMA_DEFAULT_MODEL || '').trim();
+        if (envValue) return envValue;
+        throw new Error('No model configured. Set system_settings.default_model or OLLAMA_DEFAULT_MODEL.');
     }
 
     private setupWebSocketServer(): void {

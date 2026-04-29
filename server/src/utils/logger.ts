@@ -35,10 +35,22 @@ function safeStringify(obj: any): string {
 }
 
 // Create singleton logger instance
-const logDir = path.join(process.cwd(), 'logs');
+const logDir = process.env.LOG_DIR
+  ? path.resolve(process.cwd(), String(process.env.LOG_DIR))
+  : path.join(process.cwd(), 'logs');
+
+const failureDir = process.env.FAILURE_LOG_DIR
+  ? path.resolve(process.cwd(), String(process.env.FAILURE_LOG_DIR))
+  : path.join(logDir, 'failures');
 
 try {
   fs.mkdirSync(logDir, { recursive: true });
+} catch {
+  // ignore
+}
+
+try {
+  fs.mkdirSync(failureDir, { recursive: true });
 } catch {
   // ignore
 }
@@ -124,6 +136,22 @@ export class Logger {
 
   error(message: string, meta?: any): void {
     this.logger.error(message, meta);
+
+    try {
+      const now = new Date();
+      const ts = now.toISOString().replace(/[:.]/g, '-');
+      const rand = Math.random().toString(16).slice(2, 10);
+      const filename = path.join(failureDir, `${ts}-${rand}.json`);
+      const payload = {
+        timestamp: now.toISOString(),
+        level: 'error',
+        message,
+        meta: meta ?? null
+      };
+      fs.writeFileSync(filename, safeStringify(payload), { encoding: 'utf8' });
+    } catch {
+      // ignore
+    }
   }
 
   debug(message: string, meta?: any): void {

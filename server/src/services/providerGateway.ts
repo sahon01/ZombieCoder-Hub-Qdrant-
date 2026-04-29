@@ -1,4 +1,5 @@
 import axios from 'axios';
+import crypto from 'crypto';
 import { executeQuery } from '../database/connection';
 import { Logger } from '../utils/logger';
 import { OllamaService, AgentConfig, ChatMessage } from './ollama';
@@ -23,11 +24,86 @@ type ActiveProviderSettings = {
   defaultModel: string | null;
   requestTimeoutMs: number;
   preferStreaming: boolean;
+  routingMode: 'fixed' | 'auto';
 };
 
 export class ProviderGateway {
   private logger = new Logger();
   private ollama = new OllamaService();
+
+  private getEncryptionKey(): Buffer {
+    const raw = String(process.env.PROVIDER_SECRETS_KEY || process.env.APP_ENCRYPTION_KEY || '').trim();
+    if (!raw) {
+      throw new Error('Missing PROVIDER_SECRETS_KEY (or APP_ENCRYPTION_KEY) env var for decrypting provider secrets');
+    }
+
+    const asBase64 = (() => {
+      try {
+        const b = Buffer.from(raw, 'base64');
+        if (b.length === 32) return b;
+      } catch {
+      }
+      return null;
+    })();
+    if (asBase64) return asBase64;
+
+    const asHex = (() => {
+      try {
+        const b = Buffer.from(raw, 'hex');
+        if (b.length === 32) return b;
+      } catch {
+      }
+      return null;
+    })();
+    if (asHex) return asHex;
+
+    return crypto.createHash('sha256').update(raw, 'utf8').digest();
+  }
+
+  private decryptSecret(value: string): string | null {
+    const raw = String(value || '');
+    if (!raw.startsWith('enc:')) return raw || null;
+    const parts = raw.split(':');
+    if (parts.length !== 4) return null;
+    const [, ivB64, tagB64, ctB64] = parts;
+    const key = this.getEncryptionKey();
+    const iv = Buffer.from(ivB64, 'base64');
+    const tag = Buffer.from(tagB64, 'base64');
+    const ciphertext = Buffer.from(ctB64, 'base64');
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+    decipher.setAuthTag(tag);
+    const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString('utf8');
+    return plaintext || null;
+  }
+
+  private async resolveApiKeyFromConfig(config: any, providerId?: number | null): Promise<string | null> {
+    // 1) DB/admin secrets store
+    if (providerId && (global as any).connection) {
+      try {
+        const rows = await executeQuery(
+          'SELECT setting_value FROM system_settings WHERE setting_key = ? LIMIT 1',
+          [`provider_api_key_${String(providerId)}`]
+        );
+        const v = Array.isArray(rows) && rows.length > 0 ? (rows[0] as any)?.setting_value : null;
+        if (typeof v === 'string' && v.trim()) {
+          const dec = this.decryptSecret(v.trim());
+          if (dec) return dec;
+        }
+      } catch {
+      }
+    }
+
+    // 2) Env var reference from config
+    const envVar = typeof config?.apiKeyEnvVar === 'string' ? config.apiKeyEnvVar.trim() : '';
+    if (envVar && process.env[envVar]) return String(process.env[envVar]);
+
+    // 3) Conventional env fallback
+    if (process.env.OLLAMA_CLOUD_API_KEY) return String(process.env.OLLAMA_CLOUD_API_KEY);
+    if (process.env.OLLAMA_API_KEY) return String(process.env.OLLAMA_API_KEY);
+    if (process.env.GOOGLE_GEMINI_API_KEY) return String(process.env.GOOGLE_GEMINI_API_KEY);
+    if (process.env.GOOGLE_API_KEY) return String(process.env.GOOGLE_API_KEY);
+    return null;
+  }
 
   private buildLlamaCppSystemMessage(agentConfig?: any): { role: 'system'; content: string } {
     // Use agent's system_prompt if available, otherwise use default
@@ -53,7 +129,11 @@ export class ProviderGateway {
       (typeof modelOverride === 'string' && modelOverride.trim() ? modelOverride.trim() : null) ||
       (typeof agentConfig?.config?.model === 'string' && agentConfig.config.model.trim() ? agentConfig.config.model.trim() : null) ||
       settings.defaultModel ||
-      'llama3.1:latest';
+      null;
+
+    if (!resolvedModel) {
+      throw new Error('No model configured. Set system_settings.default_model or OLLAMA_DEFAULT_MODEL (or pass model override / agent config model).');
+    }
 
     // If no active provider: prefer Ollama if available; otherwise fall back to local llama.cpp (OpenAI-compatible)
     if (!settings.providerType) {
@@ -72,7 +152,7 @@ export class ProviderGateway {
 
       if (llamaFallbackEnabled) {
         const endpoint = this.getLocalLlamaCppEndpoint();
-        const msg = [this.buildLlamaCppSystemMessage(), { role: 'user', content: prompt }];
+        const msg = [this.buildLlamaCppSystemMessage(agentConfig), { role: 'user', content: prompt }];
         return this.openAiCompatibleChatStream(endpoint, null, resolvedModel, msg, settings.requestTimeoutMs, onChunk);
       }
 
@@ -96,14 +176,14 @@ export class ProviderGateway {
       if (!settings.providerEndpoint) {
         throw new Error('llama.cpp provider endpoint is missing');
       }
-      const apiKey = this.resolveApiKeyFromConfig(providerConfig);
-      const msg = [this.buildLlamaCppSystemMessage(), { role: 'user', content: prompt }];
+      const apiKey = await this.resolveApiKeyFromConfig(providerConfig, settings.providerId);
+      const msg = [this.buildLlamaCppSystemMessage(agentConfig), { role: 'user', content: prompt }];
       return this.openAiCompatibleChatStream(settings.providerEndpoint, apiKey, resolvedModel, msg, settings.requestTimeoutMs, onChunk);
     }
 
     if (settings.providerEndpoint) {
       // Treat endpoint as Ollama-compatible generate stream
-      const apiKey = this.resolveApiKeyFromConfig(providerConfig);
+      const apiKey = await this.resolveApiKeyFromConfig(providerConfig, settings.providerId);
       return this.ollama.streamGenerate(prompt, resolvedModel, onChunk, {
         baseURL: settings.providerEndpoint,
         timeoutMs: settings.requestTimeoutMs,
@@ -167,6 +247,13 @@ export class ProviderGateway {
     const timeoutFromEnv = this.resolveEnvNumber('MODEL_REQUEST_TIMEOUT_MS', 180000);
     const preferStreamingEnv = String(process.env.PREFER_STREAMING || '').toLowerCase();
 
+    const routingModeFromEnv = String(process.env.ROUTING_MODE || '').trim().toLowerCase();
+    const routingModeSetting = await this.getSystemSetting('routing_mode');
+    const routingModeRaw = (typeof routingModeSetting === 'string' && routingModeSetting.trim())
+      ? routingModeSetting.trim().toLowerCase()
+      : routingModeFromEnv;
+    const routingMode: 'fixed' | 'auto' = routingModeRaw === 'auto' ? 'auto' : 'fixed';
+
     const defaultModel =
       (await this.getSystemSetting('default_model')) ||
       process.env.OLLAMA_DEFAULT_MODEL ||
@@ -193,46 +280,159 @@ export class ProviderGateway {
         ? parseInt(activeProviderIdSetting.trim(), 10)
         : null;
 
-    if (!providerId || Number.isNaN(providerId)) {
-      return {
-        providerId: null,
-        providerType: null,
-        providerEndpoint: null,
-        providerName: null,
-        defaultModel,
-        requestTimeoutMs,
-        preferStreaming
-      };
+    const providerIdFromEnv = (() => {
+      const raw = String(process.env.ACTIVE_PROVIDER_ID || '').trim();
+      if (!raw) return null;
+      const v = parseInt(raw, 10);
+      return Number.isFinite(v) && v > 0 ? v : null;
+    })();
+
+    const requestedProviderId = providerIdFromEnv || providerId;
+
+    const baseNoProvider: ActiveProviderSettings = {
+      providerId: null,
+      providerType: null,
+      providerEndpoint: null,
+      providerName: null,
+      defaultModel,
+      requestTimeoutMs,
+      preferStreaming,
+      routingMode
+    };
+
+    if (!requestedProviderId || Number.isNaN(requestedProviderId)) {
+      if (routingMode !== 'auto') return baseNoProvider;
+      try {
+        const rows = await executeQuery(
+          'SELECT id, name, type, api_endpoint, config_json, is_active FROM ai_providers WHERE is_active = 1 ORDER BY id ASC LIMIT 1',
+          []
+        );
+        if (!Array.isArray(rows) || rows.length === 0) return baseNoProvider;
+
+        const row = rows[0] as ProviderRow;
+        const endpoint = String((row as any).api_endpoint || '').trim();
+        let config: any = (row as any).config_json;
+        if (typeof config === 'string') {
+          try {
+            config = JSON.parse(config);
+          } catch {
+            config = {};
+          }
+        }
+
+        const cfgTimeout = typeof config?.timeout_ms === 'number' ? config.timeout_ms : undefined;
+        const cfgPreferStreaming = typeof config?.prefer_streaming === 'boolean' ? config.prefer_streaming : undefined;
+
+        return {
+          providerId: row.id,
+          providerType: this.normalizeProviderType(row.type),
+          providerEndpoint: endpoint || null,
+          providerName: row.name || null,
+          defaultModel,
+          requestTimeoutMs: typeof cfgTimeout === 'number' ? cfgTimeout : requestTimeoutMs,
+          preferStreaming: typeof cfgPreferStreaming === 'boolean' ? cfgPreferStreaming : preferStreaming,
+          routingMode
+        };
+      } catch (e) {
+        this.logger.warn('Failed to auto-route provider; continuing with no provider', e);
+        return baseNoProvider;
+      }
     }
 
     try {
       const rows = await executeQuery(
         'SELECT id, name, type, api_endpoint, config_json, is_active FROM ai_providers WHERE id = ? LIMIT 1',
-        [providerId]
+        [requestedProviderId]
       );
       if (!Array.isArray(rows) || rows.length === 0) {
+        if (routingMode !== 'auto') {
+          return {
+            providerId: requestedProviderId,
+            providerType: null,
+            providerEndpoint: null,
+            providerName: null,
+            defaultModel,
+            requestTimeoutMs,
+            preferStreaming,
+            routingMode
+          };
+        }
+
+        const autoRows = await executeQuery(
+          'SELECT id, name, type, api_endpoint, config_json, is_active FROM ai_providers WHERE is_active = 1 ORDER BY id ASC LIMIT 1',
+          []
+        );
+        if (!Array.isArray(autoRows) || autoRows.length === 0) return baseNoProvider;
+
+        const row = autoRows[0] as ProviderRow;
+        const endpoint = String((row as any).api_endpoint || '').trim();
+        let config: any = (row as any).config_json;
+        if (typeof config === 'string') {
+          try {
+            config = JSON.parse(config);
+          } catch {
+            config = {};
+          }
+        }
+        const cfgTimeout = typeof config?.timeout_ms === 'number' ? config.timeout_ms : undefined;
+        const cfgPreferStreaming = typeof config?.prefer_streaming === 'boolean' ? config.prefer_streaming : undefined;
+
         return {
-          providerId,
-          providerType: null,
-          providerEndpoint: null,
-          providerName: null,
+          providerId: row.id,
+          providerType: this.normalizeProviderType(row.type),
+          providerEndpoint: endpoint || null,
+          providerName: row.name || null,
           defaultModel,
-          requestTimeoutMs,
-          preferStreaming
+          requestTimeoutMs: typeof cfgTimeout === 'number' ? cfgTimeout : requestTimeoutMs,
+          preferStreaming: typeof cfgPreferStreaming === 'boolean' ? cfgPreferStreaming : preferStreaming,
+          routingMode
         };
       }
 
       const row = rows[0] as ProviderRow;
       const isActive = Boolean((row as any).is_active ?? (row as any).isActive ?? true);
       if (!isActive) {
+        if (routingMode !== 'auto') {
+          return {
+            providerId: requestedProviderId,
+            providerType: null,
+            providerEndpoint: null,
+            providerName: row.name || null,
+            defaultModel,
+            requestTimeoutMs,
+            preferStreaming,
+            routingMode
+          };
+        }
+
+        const autoRows = await executeQuery(
+          'SELECT id, name, type, api_endpoint, config_json, is_active FROM ai_providers WHERE is_active = 1 ORDER BY id ASC LIMIT 1',
+          []
+        );
+        if (!Array.isArray(autoRows) || autoRows.length === 0) return baseNoProvider;
+
+        const r2 = autoRows[0] as ProviderRow;
+        const endpoint2 = String((r2 as any).api_endpoint || '').trim();
+        let config2: any = (r2 as any).config_json;
+        if (typeof config2 === 'string') {
+          try {
+            config2 = JSON.parse(config2);
+          } catch {
+            config2 = {};
+          }
+        }
+        const cfgTimeout2 = typeof config2?.timeout_ms === 'number' ? config2.timeout_ms : undefined;
+        const cfgPreferStreaming2 = typeof config2?.prefer_streaming === 'boolean' ? config2.prefer_streaming : undefined;
+
         return {
-          providerId,
-          providerType: null,
-          providerEndpoint: null,
-          providerName: row.name || null,
+          providerId: r2.id,
+          providerType: this.normalizeProviderType(r2.type),
+          providerEndpoint: endpoint2 || null,
+          providerName: r2.name || null,
           defaultModel,
-          requestTimeoutMs,
-          preferStreaming
+          requestTimeoutMs: typeof cfgTimeout2 === 'number' ? cfgTimeout2 : requestTimeoutMs,
+          preferStreaming: typeof cfgPreferStreaming2 === 'boolean' ? cfgPreferStreaming2 : preferStreaming,
+          routingMode
         };
       }
 
@@ -251,43 +451,33 @@ export class ProviderGateway {
       const cfgPreferStreaming = typeof config?.prefer_streaming === 'boolean' ? config.prefer_streaming : undefined;
 
       return {
-        providerId,
+        providerId: requestedProviderId,
         providerType: this.normalizeProviderType(row.type),
         providerEndpoint: endpoint || null,
         providerName: row.name || null,
         defaultModel,
         requestTimeoutMs: typeof cfgTimeout === 'number' ? cfgTimeout : requestTimeoutMs,
-        preferStreaming: typeof cfgPreferStreaming === 'boolean' ? cfgPreferStreaming : preferStreaming
+        preferStreaming: typeof cfgPreferStreaming === 'boolean' ? cfgPreferStreaming : preferStreaming,
+        routingMode
       };
     } catch (e) {
       this.logger.warn('Failed to resolve active provider; falling back to env/default provider', e);
       return {
-        providerId,
+        providerId: requestedProviderId,
         providerType: null,
         providerEndpoint: null,
         providerName: null,
         defaultModel,
         requestTimeoutMs,
-        preferStreaming
+        preferStreaming,
+        routingMode
       };
     }
   }
 
-  private resolveApiKeyFromConfig(config: any): string | null {
-    // Security policy: do NOT persist raw API keys in DB. Accept only env var references.
-    const envVar = typeof config?.apiKeyEnvVar === 'string' ? config.apiKeyEnvVar.trim() : '';
-    if (envVar && process.env[envVar]) return String(process.env[envVar]);
-
-    // Allow fallback to conventional env names.
-    if (process.env.OLLAMA_CLOUD_API_KEY) return String(process.env.OLLAMA_CLOUD_API_KEY);
-    if (process.env.OLLAMA_API_KEY) return String(process.env.OLLAMA_API_KEY);
-    if (process.env.GOOGLE_GEMINI_API_KEY) return String(process.env.GOOGLE_GEMINI_API_KEY);
-    if (process.env.GOOGLE_API_KEY) return String(process.env.GOOGLE_API_KEY);
-    return null;
-  }
-
   private async geminiGenerate(prompt: string, model: string, timeoutMs: number, config: any): Promise<string> {
-    const apiKey = this.resolveApiKeyFromConfig(config);
+    const settings = await this.getActiveProviderSettings();
+    const apiKey = await this.resolveApiKeyFromConfig(config, settings.providerId);
     if (!apiKey) {
       throw new Error('Gemini API key not configured. Set GOOGLE_GEMINI_API_KEY (or config_json.apiKeyEnvVar).');
     }
@@ -437,7 +627,11 @@ export class ProviderGateway {
       (typeof modelOverride === 'string' && modelOverride.trim() ? modelOverride.trim() : null) ||
       (typeof agentConfig?.config?.model === 'string' && agentConfig.config.model.trim() ? agentConfig.config.model.trim() : null) ||
       settings.defaultModel ||
-      'llama3.1:latest';
+      null;
+
+    if (!resolvedModel) {
+      throw new Error('No model configured. Set system_settings.default_model or OLLAMA_DEFAULT_MODEL (or pass model override / agent config model).');
+    }
 
     // If no active provider: prefer Ollama if available; otherwise fall back to local llama.cpp (OpenAI-compatible)
     if (!settings.providerType) {
@@ -494,14 +688,14 @@ export class ProviderGateway {
         throw new Error('llama.cpp provider endpoint is missing');
       }
 
-      const apiKey = this.resolveApiKeyFromConfig(providerConfig);
+      const apiKey = await this.resolveApiKeyFromConfig(providerConfig, settings.providerId);
       const msg = [this.buildLlamaCppSystemMessage(agentConfig), { role: 'user', content: prompt }];
       return this.openAiCompatibleChat(settings.providerEndpoint, apiKey, resolvedModel, msg, settings.requestTimeoutMs);
     }
 
     // ollama/custom/openai/glm: treat as ollama-like if endpoint provided.
     if (settings.providerEndpoint) {
-      const apiKey = this.resolveApiKeyFromConfig(providerConfig);
+      const apiKey = await this.resolveApiKeyFromConfig(providerConfig, settings.providerId);
       return this.ollama.generate(prompt, resolvedModel, agentConfig, {
         baseURL: settings.providerEndpoint,
         apiKey,
@@ -590,7 +784,7 @@ export class ProviderGateway {
       if (!settings.providerEndpoint) {
         throw new Error('llama.cpp provider endpoint is missing');
       }
-      const apiKey = this.resolveApiKeyFromConfig(providerConfig);
+      const apiKey = await this.resolveApiKeyFromConfig(providerConfig, settings.providerId);
       return this.openAiCompatibleChat(
         settings.providerEndpoint,
         apiKey,
@@ -604,7 +798,7 @@ export class ProviderGateway {
     }
 
     if (settings.providerEndpoint) {
-      const apiKey = this.resolveApiKeyFromConfig(providerConfig);
+      const apiKey = await this.resolveApiKeyFromConfig(providerConfig, settings.providerId);
       return this.ollama.chat(messages, resolvedModel, agentConfig, {
         baseURL: settings.providerEndpoint,
         apiKey,
@@ -681,7 +875,7 @@ export class ProviderGateway {
       if (!settings.providerEndpoint) {
         throw new Error('llama.cpp provider endpoint is missing');
       }
-      const apiKey = this.resolveApiKeyFromConfig(providerConfig);
+      const apiKey = await this.resolveApiKeyFromConfig(providerConfig, settings.providerId);
       return this.openAiCompatibleChatStream(
         settings.providerEndpoint,
         apiKey,
@@ -693,7 +887,7 @@ export class ProviderGateway {
     }
 
     if (settings.providerEndpoint) {
-      const apiKey = this.resolveApiKeyFromConfig(providerConfig);
+      const apiKey = await this.resolveApiKeyFromConfig(providerConfig, settings.providerId);
       const joined = messages.map(m => `${m.role}: ${m.content}`).join('\n');
       return this.ollama.streamGenerate(joined, resolvedModel, onChunk, {
         baseURL: settings.providerEndpoint,

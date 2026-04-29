@@ -3,6 +3,9 @@
  * ZombieCoder Identity & Ethics Integration
  */
 
+import fs from 'fs';
+import path from 'path';
+
 export interface PromptTemplate {
   name: string;
   template: string;
@@ -16,6 +19,8 @@ export interface PromptVariables {
 
 export class PromptTemplateService {
   private static templates: Map<string, PromptTemplate> = new Map();
+  private static cachedPersonaDoc: string | null = null;
+  private static cachedPersonaDocPath: string | null = null;
 
   // Initialize built-in templates
   static {
@@ -144,7 +149,28 @@ Response:`,
    * Build system prompt for llama.cpp with identity
    */
   static buildSystemPrompt(agentConfig?: any): string {
-    return "You are ZombieCoder. Answer questions directly in Bengali. No repetition.";
+    const base = "You are ZombieCoder. Answer questions directly in Bengali. No repetition.";
+    const agentPrompt = typeof agentConfig?.system_prompt === 'string' ? agentConfig.system_prompt.trim() : '';
+
+    const personaDocPath = String(process.env.ZOMBIECODER_PERSONA_DOC_PATH || '').trim();
+    let personaDoc = '';
+    if (personaDocPath) {
+      try {
+        if (this.cachedPersonaDocPath !== personaDocPath) {
+          const resolved = path.resolve(process.cwd(), personaDocPath);
+          this.cachedPersonaDoc = fs.readFileSync(resolved, 'utf8');
+          this.cachedPersonaDocPath = personaDocPath;
+        }
+        personaDoc = String(this.cachedPersonaDoc || '').trim();
+      } catch {
+        personaDoc = '';
+      }
+    }
+
+    const blocks = [base];
+    if (personaDoc) blocks.push(personaDoc);
+    if (agentPrompt) blocks.push(agentPrompt);
+    return blocks.join('\n\n');
   }
 
   /**

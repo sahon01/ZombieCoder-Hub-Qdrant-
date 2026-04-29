@@ -91,12 +91,8 @@ export async function POST(request: NextRequest) {
       name: body?.name,
       type: providerType,
       endpoint: body?.endpoint,
-      isActive: true,
-      config: {
-        apiKeyEnvVar: body?.apiKey || "",
-        fallbackConfig: body?.fallbackConfig || { enabled: false },
-        cacheSettings: body?.cacheSettings || { enabled: true, ttl: 300 },
-      },
+      isActive: typeof body?.isActive === "boolean" ? body.isActive : true,
+      config: typeof body?.config === "object" && body?.config ? body.config : {},
     }
 
     const response = await fetch(`${UAS_API_URL}/providers`, {

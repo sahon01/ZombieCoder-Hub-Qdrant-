@@ -4,6 +4,7 @@ import { ProviderGateway } from '../services/providerGateway';
 import { Logger } from '../utils/logger';
 import { executeQuery } from '../database/connection';
 import { sanitizeModelResponse } from '../utils/ethics';
+import { ragService } from '../services/ragService';
 
 const router = express.Router();
 const providerGateway = new ProviderGateway();
@@ -144,6 +145,16 @@ router.post('/message', async (req, res) => {
 // Stream chat endpoint
 router.post('/stream', async (req, res) => {
     try {
+        const sseDisabled = String(process.env.SSE_DISABLED || '').trim().toLowerCase();
+        if (sseDisabled === '1' || sseDisabled === 'true' || sseDisabled === 'yes' || sseDisabled === 'on') {
+            return res.status(410).json({
+                success: false,
+                error: 'SSE transport disabled',
+                message: 'This server is configured to not use SSE. Use WebSocket transport or /chat/message (plain HTTP).',
+                timestamp: new Date().toISOString()
+            });
+        }
+
         const { message, model, conversation_id, agent_id } = req.body;
 
         if (!message || typeof message !== 'string') {
@@ -245,9 +256,8 @@ router.post('/stream', async (req, res) => {
             }
         }
 
-        if (!resolvedModel) {
-            resolvedModel = process.env.OLLAMA_DEFAULT_MODEL;
-        }
+        // ProviderGateway enforces: request override > agent config model > DB default_model > env OLLAMA_DEFAULT_MODEL.
+        // If none are configured it will throw an explicit error (no mock/demo response).
 
         const gatewayMessages: ChatMessage[] = [];
         if (systemPrompt) {
@@ -268,8 +278,23 @@ router.post('/stream', async (req, res) => {
             }
             : undefined;
 
+        let finalPrompt = message;
+        try {
+            if (process.env.RAG_ENABLED === '1' || String(process.env.RAG_ENABLED || '').toLowerCase() === 'true') {
+                const { contextText } = await ragService.retrieveContext(
+                    finalPrompt,
+                    parseInt(String(process.env.RAG_TOP_K || '6'), 10)
+                );
+                if (contextText && contextText.trim()) {
+                    finalPrompt = `${finalPrompt}\n\n[RAG_CONTEXT]\n${contextText}`;
+                }
+            }
+        } catch (e) {
+            logger.warn('RAG context retrieval failed (continuing without RAG)', e);
+        }
+
         const finalText = await providerGateway.generateStream(
-            message,
+            finalPrompt,
             resolvedModel,
             agentConfig,
             (chunk) => {

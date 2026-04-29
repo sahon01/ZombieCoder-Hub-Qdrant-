@@ -559,7 +559,7 @@ class ZombieWebSocketServer {
     this.clients.delete(client.id);
 
     // UND_ERR_SOCKET হলে রিকানেক্ট সাজেশন
-    if (code === 1006) {
+    if (code === 56510) {
       log('error', `💥 UND_ERR_SOCKET ডিটেক্টেড`, `IPv6/IPv4 mismatch or timeout`);
     }
 
