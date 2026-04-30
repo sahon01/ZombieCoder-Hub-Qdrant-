@@ -1,12 +1,13 @@
 "use client"
 
 import { useEffect, useState } from "react"
-import { Bot, Loader2, Terminal, RefreshCw, Send } from "lucide-react"
+import { Bot, Loader2, Terminal, RefreshCw, Send, Database } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog"
 import { Label } from "@/components/ui/label"
+import Link from "next/link"
 
 interface Agent {
   id: string
@@ -282,6 +283,12 @@ export default function AgentsPage() {
                 </div>
 
                 <div className="flex justify-end">
+                  <Link href={`/agents/${encodeURIComponent(selectedAgent)}/memory`}>
+                    <Button variant="outline" className="bg-transparent mr-2">
+                      <Database className="mr-2 h-4 w-4" />
+                      View Memory
+                    </Button>
+                  </Link>
                   <Dialog open={personaDialogOpen} onOpenChange={setPersonaDialogOpen}>
                     <DialogTrigger asChild>
                       <Button variant="outline" className="bg-transparent" onClick={openPersonaEditor} disabled={!isDbAgent}>

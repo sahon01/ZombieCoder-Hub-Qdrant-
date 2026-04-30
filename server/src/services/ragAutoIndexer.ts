@@ -16,16 +16,21 @@ export class RagAutoIndexer {
   private logger = new Logger();
   private watcher: FSWatcher | null = null;
 
+  private overrideEnabled: boolean | null = null;
+  private overrideWatchPath: string | null = null;
+
   private indexedEvents = 0;
   private lastIndexedAt: string | null = null;
   private lastError: string | null = null;
 
   private isEnabled(): boolean {
+    if (this.overrideEnabled !== null) return this.overrideEnabled;
     const raw = String(process.env.RAG_AUTO_INDEX_ENABLED || '').trim().toLowerCase();
     return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
   }
 
   private resolveWatchPath(): string | null {
+    if (this.overrideWatchPath) return this.overrideWatchPath;
     const raw = String(process.env.RAG_WATCH_PATH || '').trim();
     if (!raw) return null;
     return path.resolve(process.cwd(), raw);
@@ -137,6 +142,20 @@ export class RagAutoIndexer {
     if (!this.watcher) return;
     await this.watcher.close();
     this.watcher = null;
+  }
+
+  async startOverride(opts?: { enabled?: boolean; watchPath?: string | null }): Promise<void> {
+    this.overrideEnabled = typeof opts?.enabled === 'boolean' ? opts.enabled : true;
+    if (typeof opts?.watchPath === 'string' && opts.watchPath.trim()) {
+      this.overrideWatchPath = path.resolve(process.cwd(), opts.watchPath.trim());
+    }
+    await this.start();
+  }
+
+  async stopOverride(): Promise<void> {
+    await this.stop();
+    this.overrideEnabled = null;
+    this.overrideWatchPath = null;
   }
 
   getStatus(): RagAutoIndexerStatus {

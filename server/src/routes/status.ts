@@ -12,6 +12,28 @@ const router = express.Router();
 const ollamaService = new OllamaService();
 const logger = new Logger();
 
+function requireApiKey(req: express.Request, res: express.Response, next: express.NextFunction) {
+    const configuredKey = process.env.UAS_API_KEY || process.env.API_KEY;
+    if (!configuredKey) {
+        return res.status(500).json({
+            success: false,
+            error: 'Server misconfiguration',
+            message: 'UAS_API_KEY/API_KEY is not set',
+            timestamp: new Date().toISOString()
+        });
+    }
+    const providedKey = req.header('X-API-Key') || '';
+    if (!providedKey || providedKey !== configuredKey) {
+        return res.status(401).json({
+            success: false,
+            error: 'Unauthorized',
+            message: 'Missing or invalid API key',
+            timestamp: new Date().toISOString()
+        });
+    }
+    return next();
+}
+
 // System status endpoint
 router.get('/', async (req, res) => {
     try {
@@ -142,6 +164,9 @@ router.get('/rag', async (req, res) => {
             vectorBackend,
             pgEnabled,
             timestamp: new Date().toISOString(),
+            embedding: {
+                model: String(process.env.EMBEDDING_MODEL || 'Xenova/all-MiniLM-L6-v2')
+            },
             ingestResult,
             metrics: ragService.getMetricsSnapshot(),
             autoIndexer: ragAutoIndexer.getStatus(),
@@ -270,6 +295,137 @@ router.get('/rag', async (req, res) => {
         logger.error('RAG status check failed:', error);
         return res.status(500).json({
             error: 'Failed to get RAG status',
+            message: error instanceof Error ? error.message : 'Unknown error',
+            timestamp: new Date().toISOString()
+        });
+    }
+});
+
+router.get('/rag/auto-indexer', async (req, res) => {
+    try {
+        return res.json({
+            success: true,
+            autoIndexer: ragAutoIndexer.getStatus(),
+            metrics: ragService.getMetricsSnapshot(),
+            timestamp: new Date().toISOString()
+        });
+    } catch (error) {
+        logger.error('Failed to get auto-indexer status', error);
+        return res.status(500).json({
+            success: false,
+            error: 'Failed to get auto-indexer status',
+            message: error instanceof Error ? error.message : 'Unknown error',
+            timestamp: new Date().toISOString()
+        });
+    }
+});
+
+router.post('/rag/auto-indexer/start', requireApiKey, async (req, res) => {
+    try {
+        const watchPath = typeof req.body?.watchPath === 'string' ? req.body.watchPath : null;
+        await ragAutoIndexer.startOverride({ watchPath });
+        return res.json({
+            success: true,
+            message: 'Auto-indexer start attempted',
+            autoIndexer: ragAutoIndexer.getStatus(),
+            timestamp: new Date().toISOString()
+        });
+    } catch (error) {
+        logger.error('Failed to start auto-indexer', error);
+        return res.status(500).json({
+            success: false,
+            error: 'Failed to start auto-indexer',
+            message: error instanceof Error ? error.message : 'Unknown error',
+            timestamp: new Date().toISOString()
+        });
+    }
+});
+
+router.post('/rag/auto-indexer/stop', requireApiKey, async (req, res) => {
+    try {
+        await ragAutoIndexer.stopOverride();
+        return res.json({
+            success: true,
+            message: 'Auto-indexer stopped',
+            autoIndexer: ragAutoIndexer.getStatus(),
+            timestamp: new Date().toISOString()
+        });
+    } catch (error) {
+        logger.error('Failed to stop auto-indexer', error);
+        return res.status(500).json({
+            success: false,
+            error: 'Failed to stop auto-indexer',
+            message: error instanceof Error ? error.message : 'Unknown error',
+            timestamp: new Date().toISOString()
+        });
+    }
+});
+
+router.post('/rag/ingest/metadata', requireApiKey, async (req, res) => {
+    try {
+        const allowIngest = String(process.env.RAG_ALLOW_STATUS_INGEST || '').trim().toLowerCase();
+        const canIngest = allowIngest === '1' || allowIngest === 'true' || allowIngest === 'yes' || allowIngest === 'on';
+        if (!canIngest) {
+            return res.status(403).json({
+                success: false,
+                error: 'Ingest is disabled',
+                message: 'Set RAG_ALLOW_STATUS_INGEST=true to enable ingest endpoints',
+                timestamp: new Date().toISOString()
+            });
+        }
+
+        const ingestResult = await ragService.ingestMetadataMd();
+        return res.json({
+            success: true,
+            ingestResult,
+            metrics: ragService.getMetricsSnapshot(),
+            timestamp: new Date().toISOString()
+        });
+    } catch (error) {
+        logger.error('Failed to ingest metadata.md', error);
+        return res.status(500).json({
+            success: false,
+            error: 'Failed to ingest metadata.md',
+            message: error instanceof Error ? error.message : 'Unknown error',
+            timestamp: new Date().toISOString()
+        });
+    }
+});
+
+router.post('/rag/ingest/file', requireApiKey, async (req, res) => {
+    try {
+        const allowIngest = String(process.env.RAG_ALLOW_STATUS_INGEST || '').trim().toLowerCase();
+        const canIngest = allowIngest === '1' || allowIngest === 'true' || allowIngest === 'yes' || allowIngest === 'on';
+        if (!canIngest) {
+            return res.status(403).json({
+                success: false,
+                error: 'Ingest is disabled',
+                message: 'Set RAG_ALLOW_STATUS_INGEST=true to enable ingest endpoints',
+                timestamp: new Date().toISOString()
+            });
+        }
+
+        const filePath = typeof req.body?.filePath === 'string' ? req.body.filePath : '';
+        if (!filePath || !filePath.trim()) {
+            return res.status(400).json({
+                success: false,
+                error: 'filePath is required',
+                timestamp: new Date().toISOString()
+            });
+        }
+
+        const ingestResult = await ragService.ingestFile(filePath.trim(), { type: 'manual' });
+        return res.json({
+            success: true,
+            ingestResult,
+            metrics: ragService.getMetricsSnapshot(),
+            timestamp: new Date().toISOString()
+        });
+    } catch (error) {
+        logger.error('Failed to ingest file', error);
+        return res.status(500).json({
+            success: false,
+            error: 'Failed to ingest file',
             message: error instanceof Error ? error.message : 'Unknown error',
             timestamp: new Date().toISOString()
         });

@@ -135,29 +135,31 @@ export class ProviderGateway {
       throw new Error('No model configured. Set system_settings.default_model or OLLAMA_DEFAULT_MODEL (or pass model override / agent config model).');
     }
 
-    // If no active provider: prefer Ollama if available; otherwise fall back to local llama.cpp (OpenAI-compatible)
-    if (!settings.providerType) {
-      const llamaFallbackEnabled = this.resolveEnvBoolean('LLAMA_CPP_FALLBACK_ENABLED');
+    const routedSettings = await this.ensureProviderSupportsModel(settings, resolvedModel);
 
+    if (!routedSettings.providerId) {
+      // no active provider -> prefer Ollama if available; otherwise fall back to local llama.cpp (OpenAI-compatible)
+      const llamaFallbackEnabled = this.resolveEnvBoolean('LLAMA_CPP_FALLBACK_ENABLED');
       try {
         const ok = await this.ollama.testConnection();
         if (ok) {
           return this.ollama.streamGenerate(prompt, resolvedModel, onChunk, {
-            timeoutMs: settings.requestTimeoutMs,
+            timeoutMs: routedSettings.requestTimeoutMs,
             agentConfig
           });
         }
       } catch {
+        // ignore
       }
 
       if (llamaFallbackEnabled) {
         const endpoint = this.getLocalLlamaCppEndpoint();
         const msg = [this.buildLlamaCppSystemMessage(agentConfig), { role: 'user', content: prompt }];
-        return this.openAiCompatibleChatStream(endpoint, null, resolvedModel, msg, settings.requestTimeoutMs, onChunk);
+        return this.openAiCompatibleChatStream(endpoint, null, resolvedModel, msg, routedSettings.requestTimeoutMs, onChunk);
       }
 
       return this.ollama.streamGenerate(prompt, resolvedModel, onChunk, {
-        timeoutMs: settings.requestTimeoutMs,
+        timeoutMs: routedSettings.requestTimeoutMs,
         agentConfig
       });
     }
@@ -165,37 +167,85 @@ export class ProviderGateway {
     // Load provider config
     let providerConfig: any = {};
     try {
-      const rows = await executeQuery('SELECT config_json FROM ai_providers WHERE id = ? LIMIT 1', [settings.providerId]);
+      const rows = await executeQuery('SELECT config_json FROM ai_providers WHERE id = ? LIMIT 1', [routedSettings.providerId]);
       const cfg = Array.isArray(rows) && rows.length > 0 ? (rows[0] as any).config_json : null;
       providerConfig = typeof cfg === 'string' ? JSON.parse(cfg) : (cfg || {});
     } catch {
       providerConfig = {};
     }
 
-    if (settings.providerType === 'llama_cpp') {
-      if (!settings.providerEndpoint) {
-        throw new Error('llama.cpp provider endpoint is missing');
-      }
-      const apiKey = await this.resolveApiKeyFromConfig(providerConfig, settings.providerId);
-      const msg = [this.buildLlamaCppSystemMessage(agentConfig), { role: 'user', content: prompt }];
-      return this.openAiCompatibleChatStream(settings.providerEndpoint, apiKey, resolvedModel, msg, settings.requestTimeoutMs, onChunk);
+    if (routedSettings.providerType === 'google') {
+      return this.geminiStream(prompt, resolvedModel, routedSettings.requestTimeoutMs, providerConfig, onChunk);
     }
 
-    if (settings.providerEndpoint) {
+    if (routedSettings.providerType === 'llama_cpp') {
+      if (!routedSettings.providerEndpoint) {
+        throw new Error('Active provider is llama_cpp but api_endpoint is missing');
+      }
+      const apiKey = await this.resolveApiKeyFromConfig(providerConfig, routedSettings.providerId);
+      const msg = [this.buildLlamaCppSystemMessage(agentConfig), { role: 'user', content: prompt }];
+      return this.openAiCompatibleChatStream(routedSettings.providerEndpoint, apiKey, resolvedModel, msg, routedSettings.requestTimeoutMs, onChunk);
+    }
+
+    if (routedSettings.providerEndpoint) {
       // Treat endpoint as Ollama-compatible generate stream
-      const apiKey = await this.resolveApiKeyFromConfig(providerConfig, settings.providerId);
+      const apiKey = await this.resolveApiKeyFromConfig(providerConfig, routedSettings.providerId);
       return this.ollama.streamGenerate(prompt, resolvedModel, onChunk, {
-        baseURL: settings.providerEndpoint,
-        timeoutMs: settings.requestTimeoutMs,
+        baseURL: routedSettings.providerEndpoint,
+        timeoutMs: routedSettings.requestTimeoutMs,
         apiKey,
         agentConfig
       });
     }
 
     return this.ollama.streamGenerate(prompt, resolvedModel, onChunk, {
-      timeoutMs: settings.requestTimeoutMs,
+      timeoutMs: routedSettings.requestTimeoutMs,
       agentConfig
     });
+  }
+
+  private async ensureProviderSupportsModel(settings: ActiveProviderSettings, model: string): Promise<ActiveProviderSettings> {
+    if (!settings.providerId) return settings;
+    if (!(global as any).connection) return settings;
+
+    try {
+      const currentRows = await executeQuery(
+        'SELECT COUNT(*) AS cnt FROM ai_models WHERE provider_id = ? AND model_name = ? LIMIT 1',
+        [settings.providerId, model]
+      );
+      const cnt = Array.isArray(currentRows) && currentRows.length ? Number((currentRows[0] as any).cnt || 0) : 0;
+      if (cnt > 0) return settings;
+
+      if (settings.routingMode !== 'auto') {
+        throw new Error(
+          `Default model '${model}' is not available on active provider '${settings.providerName || settings.providerId}'. ` +
+          `Either change Settings -> Default Model, or switch active provider, or set routing_mode=auto for failover.`
+        );
+      }
+
+      const fallbackRows = await executeQuery(
+        `SELECT p.id, p.name, p.type, p.api_endpoint
+         FROM ai_providers p
+         JOIN ai_models m ON m.provider_id = p.id
+         WHERE p.is_active = 1 AND m.model_name = ?
+         ORDER BY p.id ASC
+         LIMIT 1`,
+        [model]
+      );
+
+      if (!Array.isArray(fallbackRows) || fallbackRows.length === 0) return settings;
+      const row = fallbackRows[0] as any;
+      return {
+        ...settings,
+        providerId: Number(row.id),
+        providerName: row.name || null,
+        providerType: this.normalizeProviderType(row.type),
+        providerEndpoint: String(row.api_endpoint || '').trim() || null
+      };
+    } catch (e) {
+      if (e instanceof Error) throw e;
+      return settings;
+    }
   }
 
   private resolveEnvBoolean(key: string): boolean {
@@ -509,6 +559,23 @@ export class ProviderGateway {
     const candidates = (response.data as any)?.candidates;
     const text = candidates?.[0]?.content?.parts?.map((p: any) => p?.text).filter(Boolean).join('') || '';
     return String(text || '').trim();
+  }
+
+  private async geminiStream(
+    prompt: string,
+    model: string,
+    timeoutMs: number,
+    config: any,
+    onChunk?: (chunk: string) => void
+  ): Promise<string> {
+    const text = await this.geminiGenerate(prompt, model, timeoutMs, config);
+    if (onChunk) {
+      try {
+        onChunk(text);
+      } catch {
+      }
+    }
+    return text;
   }
 
   private async openAiCompatibleChat(
